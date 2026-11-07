@@ -5,9 +5,62 @@ import Graph from "./Graph";
 import { parseEquation } from "./parseEquation";
 
 const TURN_MS = 30 * 1000;
+const MAX_SHOTS = 8;
+const SERVER_URL = `ws://${window.location.hostname}:8000/ws`;
 
 const styles = {
   page: { position: "fixed", inset: 0, background: "#fff", colorScheme: "light" },
+  lobby: {
+    position: "fixed",
+    inset: 0,
+    background: "#fff",
+    colorScheme: "light",
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "center",
+    fontFamily: "system-ui, sans-serif",
+    color: "#111",
+  },
+  card: {
+    display: "flex",
+    flexDirection: "column",
+    gap: "14px",
+    alignItems: "center",
+    padding: "28px 32px",
+    border: "1px solid #c8c8c8",
+    borderRadius: "12px",
+    boxShadow: "0 4px 18px rgba(0, 0, 0, 0.12)",
+    minWidth: "280px",
+    background: "#fff",
+    color: "#111",
+  },
+  codeInput: {
+    width: "110px",
+    padding: "6px 8px",
+    fontSize: "18px",
+    textAlign: "center",
+    letterSpacing: "4px",
+    border: "1px solid #c8c8c8",
+    borderRadius: "6px",
+    color: "#111",
+    background: "#fff",
+    colorScheme: "light",
+  },
+  code: { fontSize: "40px", letterSpacing: "8px", fontWeight: 700 },
+  banner: {
+    position: "absolute",
+    top: "16px",
+    left: "50%",
+    transform: "translateX(-50%)",
+    background: "#fff",
+    color: "#111",
+    border: "1px solid #c8c8c8",
+    borderRadius: "10px",
+    boxShadow: "0 4px 18px rgba(0, 0, 0, 0.15)",
+    padding: "12px 18px",
+    fontFamily: "system-ui, sans-serif",
+    textAlign: "center",
+  },
   bar: {
     position: "absolute",
     left: "50%",
@@ -56,26 +109,74 @@ const styles = {
   error: { marginTop: "6px", fontSize: "13px", color: "#c0392b", fontFamily: "system-ui, sans-serif" },
 };
 
+// replace one slot of a [p0, p1] array held in state
+const setAt = (setter, i, v) => setter((arr) => arr.map((x, j) => (j === i ? v : x)));
+
+function strokePath(ctx, toX, toY, points, color, width) {
+  ctx.strokeStyle = color;
+  ctx.lineWidth = width;
+  ctx.lineJoin = "round";
+  ctx.beginPath();
+  let prevY = null;
+  points.forEach((p, i) => {
+    const px = toX(p.x);
+    const py = toY(p.y);
+    if (i === 0 || Math.abs(p.y - prevY) > 50) ctx.moveTo(px, py); // lift the pen across jumps
+    else ctx.lineTo(px, py);
+    prevY = p.y;
+  });
+  ctx.stroke();
+}
+
 export default function GameScreen() {
+  // --- lobby / connection ---
+  const [phase, setPhase] = useState("lobby"); // lobby | waiting | playing | over
+  const [socket, setSocket] = useState(null);
+  const [roomCode, setRoomCode] = useState("");
+  const [joinCode, setJoinCode] = useState("");
+  const [lobbyError, setLobbyError] = useState(null);
+
+  // --- match state ---
+  const [seed, setSeed] = useState(null);
+  const [me, setMe] = useState(0);
+  const [turn, setTurn] = useState(-1);
+  const [balls, setBalls] = useState([null, null]);
+  const [shots, setShots] = useState([0, 0]);
+  const [finished, setFinished] = useState([false, false]);
+  const [usedMs, setUsedMs] = useState(0); // my total thinking time, for the tiebreak
+  const [results, setResults] = useState(null);
+  const [oppTrace, setOppTrace] = useState(null);
+
+  // --- my shot input ---
   const [text, setText] = useState("");
   const [fn, setFn] = useState(null);
   const [error, setError] = useState(null);
-
-  const [seed, setSeed] = useState(
-    () => Number(new URLSearchParams(window.location.search).get("seed")) || 42
-  );
-  const course = useMemo(() => generateCourse(seed), [seed]);
-
-  const [ball, setBall] = useState(() => course.tee);
-  const [dir, setDir] = useState(1); // 1 = right, -1 = mirrored
+  const [dir, setDir] = useState(1);
   const [stopText, setStopText] = useState("");
-  const [shots, setShots] = useState(0);
-  const [won, setWon] = useState(false);
 
-  // Turn clock: driven by a start timestamp, so a server can supply it later
-  const [turnStart, setTurnStart] = useState(() => Date.now());
-  const [now, setNow] = useState(() => Date.now());
+  // --- turn clock ---
+  const [turnStart, setTurnStart] = useState(0);
+  const [now, setNow] = useState(0);
+
+  const course = useMemo(() => (seed == null ? null : generateCourse(seed)), [seed]);
+  const myTurn = phase === "playing" && turn === me && !finished[me];
   const secondsLeft = Math.max(0, Math.ceil((turnStart + TURN_MS - now) / 1000));
+
+  const stopDx =
+    stopText.trim() === "" || Number.isNaN(Number(stopText)) ? null : Number(stopText);
+
+  const myBall = balls[me];
+  const preview = useMemo(
+    () => (myTurn && fn && course && myBall ? traceShot(course, fn, myBall, dir, stopDx) : null),
+    [myTurn, fn, course, myBall, dir, stopDx]
+  );
+
+  const send = useCallback(
+    (msg) => {
+      if (socket && socket.readyState === WebSocket.OPEN) socket.send(JSON.stringify(msg));
+    },
+    [socket]
+  );
 
   const startTurn = useCallback(() => {
     const t = Date.now();
@@ -83,33 +184,119 @@ export default function GameScreen() {
     setNow(t);
   }, []);
 
+  const connect = (first) => {
+    setLobbyError(null);
+    const ws = new WebSocket(SERVER_URL);
+    ws.onopen = () => ws.send(JSON.stringify(first));
+    ws.onerror = () => setLobbyError("Can't reach the server. Is it running?");
+    setSocket(ws);
+  };
+
+  // --- messages from the server ---
+  const onMessage = useCallback(
+    (e) => {
+      const msg = JSON.parse(e.data);
+
+      if (msg.type === "created") {
+        setRoomCode(msg.code);
+        setPhase("waiting");
+      } else if (msg.type === "error") {
+        setLobbyError(msg.message);
+        e.target.close();
+        setSocket(null);
+      } else if (msg.type === "start") {
+        const c = generateCourse(msg.seed);
+        setSeed(msg.seed);
+        setMe(msg.you);
+        setBalls([c.tee, c.tee]);
+        setShots([0, 0]);
+        setFinished([false, false]);
+        setUsedMs(0);
+        setResults(null);
+        setOppTrace(null);
+        setTurn(msg.turn);
+        if (msg.turn === msg.you) startTurn();
+        setPhase("playing");
+      } else if (msg.type === "shot") {
+        if (msg.player === me) return; // I already applied my own shot
+        setAt(setShots, msg.player, msg.shots);
+        setAt(setFinished, msg.player, msg.finished);
+        if (msg.timeout || !course) {
+          setOppTrace(null);
+          return;
+        }
+        try {
+          const f = parseEquation(msg.equation);
+          const r = traceShot(course, f, balls[msg.player], msg.dir, msg.stopDx);
+          setAt(setBalls, msg.player, r.end);
+          setOppTrace(r.points);
+        } catch {
+          setOppTrace(null);
+        }
+      } else if (msg.type === "turn") {
+        setTurn(msg.player);
+        if (msg.player === me) startTurn();
+      } else if (msg.type === "over") {
+        setResults(msg.results);
+        setPhase("over");
+      } else if (msg.type === "left") {
+        if (phase !== "over") {
+          setLobbyError("Your opponent left the game");
+          setPhase("lobby");
+          e.target.close();
+          setSocket(null);
+        }
+      }
+    },
+    [me, course, balls, phase, startTurn]
+  );
+
   useEffect(() => {
-    if (won) return;
+    if (!socket) return;
+    socket.addEventListener("message", onMessage);
+    return () => socket.removeEventListener("message", onMessage);
+  }, [socket, onMessage]);
+
+  // --- shooting ---
+  const fire = () => {
+    if (!myTurn || !preview || preview.result === "invalid") return;
+    const elapsed = Math.min(Date.now() - turnStart, TURN_MS);
+    const newUsed = usedMs + elapsed;
+    const newShots = shots[me] + 1;
+    const done = preview.result === "hole" || newShots >= MAX_SHOTS;
+    setAt(setBalls, me, preview.end);
+    setAt(setShots, me, newShots);
+    setAt(setFinished, me, done);
+    setUsedMs(newUsed);
+    setTurn(-1); // nobody's turn until the server says so
+    setOppTrace(null);
+    send({ type: "shot", equation: text, dir, stopDx, shots: newShots, timeMs: newUsed, finished: done });
+  };
+
+  const handleTimeout = useCallback(() => {
+    const newShots = shots[me] + 1;
+    const done = newShots >= MAX_SHOTS;
+    const newUsed = usedMs + TURN_MS;
+    setAt(setShots, me, newShots);
+    setAt(setFinished, me, done);
+    setUsedMs(newUsed);
+    setTurn(-1);
+    send({ type: "timeout", shots: newShots, timeMs: newUsed, finished: done });
+  }, [me, shots, usedMs, send]);
+
+  useEffect(() => {
+    if (!myTurn) return;
     const id = setInterval(() => {
       const t = Date.now();
       setNow(t);
-      if (t >= turnStart + TURN_MS) {
-        // time's up: skipped turn counts as a shot, ball stays where it is
-        setShots((s) => s + 1);
-        setTurnStart(t);
-      }
+      if (t >= turnStart + TURN_MS) handleTimeout();
     }, 250);
     return () => clearInterval(id);
-  }, [turnStart, won]);
+  }, [myTurn, turnStart, handleTimeout]);
 
-  const stopDx =
-    stopText.trim() === "" || Number.isNaN(Number(stopText)) ? null : Number(stopText);
-
-  // The preview and the real shot are the same trace
-  const preview = useMemo(
-    () => (fn ? traceShot(course, fn, ball, dir, stopDx) : null),
-    [course, fn, ball, dir, stopDx]
-  );
-
-  const onChange = (e) => {
-    const value = e.target.value;
+  const onChange = (value) => {
     setText(value);
-    if (!value.replace(/^\s*y\s*=/i, "").trim()) {
+    if (!value.trim()) {
       setFn(null);
       setError(null);
       return;
@@ -123,27 +310,11 @@ export default function GameScreen() {
     }
   };
 
-  const fire = () => {
-    if (!preview || won || preview.result === "invalid") return;
-    setBall(preview.end);
-    setShots((s) => s + 1);
-    if (preview.result === "hole") setWon(true);
-    else startTurn(); // fresh 30 seconds for the next shot
-  };
-
-  const newCourse = () => {
-    const s = Math.floor(Math.random() * 1e9);
-    setSeed(s);
-    setBall(generateCourse(s).tee);
-    setShots(0);
-    setWon(false);
-    startTurn();
-    window.history.replaceState(null, "", `?seed=${s}`);
-  };
-
+  // --- drawing ---
   const draw = useCallback(
     (ctx, toX, toY, scale) => {
-      // --- course ---
+      if (!course) return;
+
       ctx.fillStyle = "#888";
       for (const wall of course.walls) {
         ctx.fillRect(toX(wall.x), toY(wall.y + wall.h), wall.w * scale, wall.h * scale);
@@ -159,45 +330,96 @@ export default function GameScreen() {
       ctx.arc(toX(course.tee.x), toY(course.tee.y), 5, 0, Math.PI * 2);
       ctx.fill();
 
-      // --- preview of the shot ---
-      if (preview && !won) {
-        ctx.strokeStyle = "#2d70b3";
-        ctx.lineWidth = 2.5;
-        ctx.lineJoin = "round";
-        ctx.beginPath();
-        let prevY = null;
-        preview.points.forEach((p, i) => {
-          const px = toX(p.x);
-          const py = toY(p.y);
-          if (i === 0 || Math.abs(p.y - prevY) > 50) ctx.moveTo(px, py);
-          else ctx.lineTo(px, py);
-          prevY = p.y;
-        });
-        ctx.stroke();
-      }
+      if (oppTrace) strokePath(ctx, toX, toY, oppTrace, "#e67e22", 2.5); // opponent's last shot
+      if (preview) strokePath(ctx, toX, toY, preview.points, "#2d70b3", 2.5); // my preview
 
-      // --- ball ---
-      ctx.fillStyle = "#fff";
-      ctx.strokeStyle = "#111";
-      ctx.lineWidth = 2;
-      ctx.beginPath();
-      ctx.arc(toX(ball.x), toY(ball.y), 6, 0, Math.PI * 2);
-      ctx.fill();
-      ctx.stroke();
+      balls.forEach((b, i) => {
+        if (!b) return;
+        ctx.fillStyle = i === me ? "#fff" : "#e67e22";
+        ctx.strokeStyle = "#111";
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        ctx.arc(toX(b.x), toY(b.y), 6, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.stroke();
+      });
     },
-    [course, preview, ball, won]
+    [course, preview, oppTrace, balls, me]
   );
+
+  // --- lobby screens ---
+  if (phase === "lobby" || phase === "waiting") {
+    return (
+      <div style={styles.lobby}>
+        <div style={styles.card}>
+          <h2 style={{ margin: 0, color: "#111" }}>Graph Golf</h2>
+          {phase === "lobby" ? (
+            <>
+              <button onClick={() => connect({ type: "create" })}>Create game</button>
+              <div style={styles.row}>
+                <input
+                  style={styles.codeInput}
+                  value={joinCode}
+                  onChange={(e) => setJoinCode(e.target.value.toUpperCase())}
+                  placeholder="CODE"
+                  maxLength={4}
+                />
+                <button
+                  onClick={() => connect({ type: "join", code: joinCode })}
+                  disabled={joinCode.length < 4}
+                >
+                  Join
+                </button>
+              </div>
+            </>
+          ) : (
+            <>
+              <div>Share this code:</div>
+              <div style={styles.code}>{roomCode}</div>
+              <div>Waiting for the other player...</div>
+            </>
+          )}
+          {lobbyError && <div style={styles.error}>{lobbyError}</div>}
+        </div>
+      </div>
+    );
+  }
+
+  // --- game screen ---
+  let resultText = "";
+  if (phase === "over" && results) {
+    const [a, b] = results;
+    if (a.shots !== b.shots) resultText = (a.shots < b.shots ? 0 : 1) === me ? "You win!" : "You lose";
+    else if (a.timeMs !== b.timeMs) resultText = (a.timeMs < b.timeMs ? 0 : 1) === me ? "You win on time!" : "You lose on time";
+    else resultText = "Draw";
+  }
 
   return (
     <div style={styles.page}>
       <Graph draw={draw} />
+
+      {phase === "over" && results && (
+        <div style={styles.banner}>
+          <h2 style={{ margin: "0 0 6px", color: "#111" }}>{resultText}</h2>
+          <div>
+            You: {results[me].shots} shots, {(results[me].timeMs / 1000).toFixed(1)}s
+          </div>
+          <div>
+            Opponent: {results[1 - me].shots} shots, {(results[1 - me].timeMs / 1000).toFixed(1)}s
+          </div>
+          <button style={{ marginTop: "8px" }} onClick={() => window.location.reload()}>
+            Play again
+          </button>
+        </div>
+      )}
+
       <div style={styles.bar}>
         <div style={styles.row}>
           <span style={styles.label}>y =</span>
           <input
             style={styles.input}
-            value={text.replace(/^\s*y\s*=\s*/i, "")}
-            onChange={(e) => onChange({ target: { value: e.target.value } })}
+            value={text}
+            onChange={(e) => onChange(e.target.value)}
             onKeyDown={(e) => {
               if (e.key === "Enter") fire();
             }}
@@ -217,16 +439,15 @@ export default function GameScreen() {
             placeholder="stop after (optional)"
             inputMode="decimal"
           />
-          <button onClick={fire} disabled={!preview || won}>Fire</button>
-          <button onClick={newCourse}>New course</button>
-          <span>Shots: {shots}</span>
-          {!won && (
-            <strong style={{ color: secondsLeft <= 5 ? "#c0392b" : "#333" }}>
-              {secondsLeft}s
-            </strong>
+          <button onClick={fire} disabled={!myTurn || !preview}>Fire</button>
+          <span>You: {shots[me]} | Opponent: {shots[1 - me]}</span>
+          {myTurn && (
+            <strong style={{ color: secondsLeft <= 5 ? "#c0392b" : "#333" }}>{secondsLeft}s</strong>
           )}
-          {won && <strong>Hole in {shots}!</strong>}
-          {preview && !won && preview.result === "invalid" && <span>Curve undefined here</span>}
+          {phase === "playing" && !myTurn && (
+            <span>{finished[me] ? "You're done, waiting for the opponent..." : "Opponent's turn..."}</span>
+          )}
+          {myTurn && preview && preview.result === "invalid" && <span>Curve undefined here</span>}
         </div>
 
         {error && <div style={styles.error}>{error}</div>}
