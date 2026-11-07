@@ -1,4 +1,4 @@
-import React, { useEffect, useRef } from "react";
+import {useEffect, useRef} from "react";
 
 // Pick a "nice" grid step (1, 2, 5 x 10^n) close to a target size in world units
 function niceStep(target) {
@@ -86,8 +86,12 @@ function render(ctx, w, h, view, draw) {
 export default function Graph({ draw }) {
   const canvasRef = useRef(null);
   const drawRef = useRef(draw);
-  drawRef.current = draw;
   const paintRef = useRef(null);
+
+  useEffect(() => {
+    drawRef.current = draw;
+  });
+
 
   // Repaint whenever the draw function changes (e.g. a new equation)
   useEffect(() => {

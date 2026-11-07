@@ -1,4 +1,5 @@
-import React, { useCallback, useState } from "react";
+import { useCallback, useState } from "react";
+import { generateCourse } from "./courseGen";
 import Graph from "./Graph";
 import { parseEquation } from "./parseEquation";
 
@@ -26,17 +27,18 @@ const styles = {
     fontSize: "18px",
     fontFamily: "ui-monospace, Menlo, Consolas, monospace",
     background: "transparent",
-    color: "#111", // typed text is black
+    color: "#111",
     caretColor: "#111",
-    colorScheme: "light", // stops dark-mode browser styling from turning the text white
+    colorScheme: "light",
   },
   error: { marginTop: "6px", fontSize: "13px", color: "#c0392b", fontFamily: "system-ui, sans-serif" },
 };
 
 export default function GameScreen() {
   const [text, setText] = useState("");
-  const [fn, setFn] = useState(null); // last equation that parsed successfully
+  const [fn, setFn] = useState(null);
   const [error, setError] = useState(null);
+  const [course] = useState(() => generateCourse(42));
 
   const onChange = (e) => {
     const value = e.target.value;
@@ -48,16 +50,33 @@ export default function GameScreen() {
     }
     try {
       const parsed = parseEquation(value);
-      setFn(() => parsed); // wrapped so React doesn't call it as an updater
+      setFn(() => parsed);
       setError(null);
     } catch (err) {
-      setError(err.message); // keep drawing the last good equation
+      setError(err.message);
     }
   };
 
-  // Called by Graph after the grid is drawn; draws the curve for y = f(x)
   const draw = useCallback(
     (ctx, toX, toY, scale) => {
+      // --- course ---
+      ctx.fillStyle = "#888";
+      for (const wall of course.walls) {
+        ctx.fillRect(toX(wall.x), toY(wall.y + wall.h), wall.w * scale, wall.h * scale);
+      }
+
+      ctx.fillStyle = "#2a9d4a";
+      ctx.beginPath();
+      ctx.arc(toX(course.hole.x), toY(course.hole.y), course.hole.r * scale, 0, Math.PI * 2);
+      ctx.fill();
+
+      ctx.fillStyle = "#d33";
+            ctx.fillStyle = "#d33";
+      ctx.beginPath();
+      ctx.arc(toX(course.tee.x), toY(course.tee.y), 5, 0, Math.PI * 2);
+      ctx.fill();
+
+      // --- curve ---
       if (!fn) return;
       const w = ctx.canvas.clientWidth;
       const h = ctx.canvas.clientHeight;
@@ -72,7 +91,7 @@ export default function GameScreen() {
         const y = fn((px - x0) / scale);
         const py = toY(y);
         if (!Number.isFinite(y) || Math.abs(py) > 1e6) { penDown = false; continue; }
-        if (penDown && Math.abs(py - prevPy) > h) penDown = false; // break at asymptotes
+        if (penDown && Math.abs(py - prevPy) > h) penDown = false;
         if (penDown) ctx.lineTo(px, py);
         else ctx.moveTo(px, py);
         penDown = true;
@@ -80,7 +99,7 @@ export default function GameScreen() {
       }
       ctx.stroke();
     },
-    [fn]
+    [fn, course]
   );
 
   return (
