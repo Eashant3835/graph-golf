@@ -4,7 +4,10 @@ export const CONFIG = {
   holeRadius: 10,
   minTeeHoleDist: 200,
   maxTeeHoleDist: 400,
-  wallCount: 6,
+  wallCount: 3,
+  blockerMinT: 0.35, // how far along tee -> hole the blocker can sit
+  blockerMaxT: 0.8,
+  blockerMin: 50,    // min blocker width and height,
   wallMin: 20,
   wallMax: 100,
   gap: 20, // min clearance around walls, tee, and hole
@@ -70,8 +73,32 @@ export function generateCourse(seed) {
     hole = { x: tee.x + CONFIG.minTeeHoleDist, y: tee.y, r: CONFIG.holeRadius };
   }
 
-  // Walls: random rects, skipped if they touch the tee, hole, or each other
   const walls = [];
+
+  // Blocker: a wall centered on the straight line from tee to hole,
+  // so the straight-line shot always hits it
+  for (let tries = 0; tries < 30; tries++) {
+    const t = randRange(rng, CONFIG.blockerMinT, CONFIG.blockerMaxT);
+    const w = randRange(rng, CONFIG.blockerMin, CONFIG.wallMax);
+    const h = randRange(rng, CONFIG.blockerMin, CONFIG.wallMax);
+    const cx = tee.x + t * (hole.x - tee.x);
+    const cy = tee.y + t * (hole.y - tee.y);
+    const wall = { x: cx - w / 2, y: cy - h / 2, w, h };
+
+    const inRegion =
+      wall.x >= -halfW && wall.x + w <= halfW &&
+      wall.y >= -halfH && wall.y + h <= halfH;
+    const ok =
+      inRegion &&
+      !circleHitsRect(tee.x, tee.y, 0, wall, CONFIG.gap) &&
+      !circleHitsRect(hole.x, hole.y, hole.r, wall, CONFIG.gap);
+    if (ok) {
+      walls.push(wall);
+      break;
+    }
+  }
+
+  // Extra clutter walls: random, skipped if they touch the tee, hole, or other walls
   for (let i = 0; i < CONFIG.wallCount; i++) {
     for (let tries = 0; tries < 50; tries++) {
       const w = randRange(rng, CONFIG.wallMin, CONFIG.wallMax);
