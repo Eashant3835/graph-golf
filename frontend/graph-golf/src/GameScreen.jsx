@@ -6,7 +6,9 @@ import { parseEquation } from "./parseEquation";
 
 const TURN_MS = 30 * 1000;
 const MAX_SHOTS = 8;
-const SERVER_URL = `ws://${window.location.hostname}:8000/ws`;
+const SERVER_URL =
+  import.meta.env.VITE_WS_URL ||
+  `ws://${window.location.hostname}:8000/ws`;
 
 const styles = {
   page: { position: "fixed", inset: 0, background: "#fff", colorScheme: "light" },
